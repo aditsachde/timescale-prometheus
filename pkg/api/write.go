@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -18,6 +19,14 @@ import (
 
 func Write(writer pgmodel.DBInserter, elector *util.Elector, metrics *Metrics) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		// we treat invalid requests as the same as no request for
+		// leadership-timeout purposes
+		if !validateWriteHeaders(w, r) {
+			metrics.InvalidWriteReqs.Inc()
+			return
+		}
+
 		shouldWrite, err := isWriter(elector)
 		if err != nil {
 			metrics.LeaderGauge.Set(0)
@@ -103,4 +112,45 @@ func getCounterValue(counter prometheus.Counter) float64 {
 		log.Warn("msg", "Error reading counter value", "err", err, "counter", counter)
 	}
 	return dtoMetric.GetCounter().GetValue()
+}
+
+func validateWriteHeaders(w http.ResponseWriter, r *http.Request) bool {
+	// validate headers from https://github.com/prometheus/prometheus/blob/2bd077ed9724548b6a631b6ddba48928704b5c34/storage/remote/client.go
+	if r.Method != "POST" {
+		err := fmt.Sprintf("HTTP Method %s instead of POST", r.Method)
+		log.Error("msg", "Write header validation error", "err", err)
+		http.Error(w, err, http.StatusBadRequest)
+		return false
+	}
+
+	if !strings.Contains(r.Header.Get("Content-Encoding"), "snappy") {
+		err := fmt.Sprintf("non-snappy compressed data got: %s", r.Header.Get("Content-Encoding"))
+		log.Error("msg", "Write header validation error", "err", err)
+		http.Error(w, err, http.StatusBadRequest)
+		return false
+	}
+
+	if r.Header.Get("Content-Type") != "application/x-protobuf" {
+		err := "non-protobuf data"
+		log.Error("msg", "Write header validation error", "err", err)
+		http.Error(w, err, http.StatusBadRequest)
+		return false
+	}
+
+	remoteWriteVersion := r.Header.Get("X-Prometheus-Remote-Write-Version")
+	if remoteWriteVersion == "" {
+		err := "Missing X-Prometheus-Remote-Write-Version header"
+		log.Error("msg", "Write header validation error", "err", err)
+		http.Error(w, err, http.StatusBadRequest)
+		return false
+	}
+
+	if !strings.HasPrefix(remoteWriteVersion, "0.1.") {
+		err := fmt.Sprintf("unexpected Remote-Write-Version %s, expected 0.1.X", remoteWriteVersion)
+		log.Error("msg", "Write header validation error", "err", err)
+		http.Error(w, err, http.StatusBadRequest)
+		return false
+	}
+
+	return true
 }
